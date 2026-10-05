@@ -1,0 +1,193 @@
+---
+- hosts: patch_targets
+  become: yes
+  gather_facts: yes
+
+  vars:
+    # Emplacement du fichier de log dans le répertoire personnel de l'utilisateur WSL
+    log_file_path: "~/patching_activity.log"
+    security_grep_terms: 'security\|/{{ ansible_distribution_release }}-security'
+    patch_success_flag_filename_template: "/tmp/last_patch_successful_{{ ansible_date_time.date }}.flag"
+
+  tasks:
+    # Tâche pour obtenir l'heure sur le nœud de contrôle UNE SEULE FOIS
+    - name: Get current time on control node (once)
+      ansible.builtin.shell: 'date +"%Y-%m-%d %H:%M:%S"'
+      register: control_node_time_output
+      delegate_to: localhost
+      run_once: true
+      changed_when: false
+      become: no
+
+    - name: Set global timestamp fact for the play
+      ansible.builtin.set_fact:
+        play_timestamp: "{{ control_node_time_output.stdout }}"
+      run_once: true
+      become: no
+
+    # --- DÉBUT DES TÂCHES PRINCIPALES ---
+    - name: MAJ Cache APT - DÉBUT
+      ansible.builtin.lineinfile:
+        path: "{{ log_file_path }}"
+        line: "[{{ play_timestamp }}] - {{ inventory_hostname }} - MAJ Cache APT - Tentative de mise à jour du cache. - STARTED"
+        create: yes
+        mode: '0644'
+      delegate_to: localhost
+      become: no
+      tags: apt_update, logging
+
+    - name: MAJ Cache APT - EXÉCUTION
+      ansible.builtin.apt:
+        update_cache: yes
+      register: apt_update_status
+      changed_when: false
+      ignore_errors: true
+      tags: apt_update
+
+    - name: MAJ Cache APT - RÉSULTAT
+      ansible.builtin.lineinfile:
+        path: "{{ log_file_path }}"
+        line: >-
+          [{{ play_timestamp }}] - {{ inventory_hostname }} - MAJ Cache APT -
+          {% if apt_update_status.failed %}Mise à jour du cache ÉCHOUÉE (Erreur: {{ apt_update_status.msg | default('Détail non disponible') }}). - FAILED
+          {% elif apt_update_status.rc | default(0) != 0 and not apt_update_status.failed %}Mise à jour du cache avec AVERTISSEMENT (Code retour: {{ apt_update_status.rc }}, Sortie: {{ apt_update_status.stderr if apt_update_status.stderr else apt_update_status.stdout | default('Aucune sortie spécifique') }}). - WARNING
+          {% else %}Cache APT mis à jour. - SUCCESS
+          {% endif %}
+        create: yes
+        mode: '0644'
+      delegate_to: localhost
+      become: no
+      tags: apt_update, logging
+
+    - name: Vérif MAJ Sécurité - DÉBUT
+      ansible.builtin.lineinfile:
+        path: "{{ log_file_path }}"
+        line: "[{{ play_timestamp }}] - {{ inventory_hostname }} - Vérif MAJ Sécurité - Recherche des mises à jour de sécurité. - STARTED"
+        create: yes
+        mode: '0644'
+      delegate_to: localhost
+      become: no
+      tags: security_check, logging
+
+    - name: Vérif MAJ Sécurité - COLLECTE DES LIGNES DE PAQUETS
+      ansible.builtin.shell: "apt list --upgradable 2>/dev/null | grep -iE '{{ security_grep_terms }}' || true"
+      register: raw_security_updates_output
+      changed_when: false
+      tags: security_check
+
+    - name: Vérif MAJ Sécurité - EXTRACTION DES NOMS DE PAQUETS
+      ansible.builtin.set_fact:
+        security_package_names_to_update: "{{ raw_security_updates_output.stdout_lines | map('regex_replace', '^([^/]+)/.*$', '\\1') | list }}"
+      tags: security_check
+
+    - name: Vérif MAJ Sécurité - RÉSULTAT
+      ansible.builtin.lineinfile:
+        path: "{{ log_file_path }}"
+        line: >-
+          [{{ play_timestamp }}] - {{ inventory_hostname }} - Vérif MAJ Sécurité -
+          {% if raw_security_updates_output.failed %}Recherche des mises à jour BRUTES ÉCHOUÉE (Erreur: {{ raw_security_updates_output.msg | default('Détail non disponible') }}). - FAILED
+          {% elif security_package_names_to_update is defined and security_package_names_to_update | length > 0 %} {{ security_package_names_to_update | length }} mise(s) à jour de sécurité identifiée(s) : [{{ security_package_names_to_update | join(', ') }}]. - INFO
+          {% else %}Aucune mise à jour de sécurité spécifique trouvée avec les termes '{{ security_grep_terms }}'. - INFO
+          {% endif %}
+        create: yes
+        mode: '0644'
+      delegate_to: localhost
+      become: no
+      tags: security_check, logging
+
+    - name: Appli MAJ Sécurité - DÉBUT
+      ansible.builtin.lineinfile:
+        path: "{{ log_file_path }}"
+        line: >-
+          [{{ play_timestamp }}] - {{ inventory_hostname }} - Appli MAJ Sécurité -
+          Tentative d'application pour {{ security_package_names_to_update | length }} paquet(s) identifié(s) comme mise(s) à jour de sécurité: [{{ security_package_names_to_update | join(', ') }}]. - STARTED
+        create: yes
+        mode: '0644'
+      delegate_to: localhost
+      become: no
+      tags: security_apply, logging
+      when: security_package_names_to_update is defined and security_package_names_to_update | length > 0
+
+    - name: Appli MAJ Sécurité - EXÉCUTION
+      ansible.builtin.apt:
+        name: "{{ security_package_names_to_update }}"
+        state: latest
+        only_upgrade: yes
+      register: apply_security_updates_result
+      tags: security_apply
+      when: security_package_names_to_update is defined and security_package_names_to_update | length > 0
+
+    - name: Appli MAJ Sécurité - RÉSULTAT (Affiné)
+      ansible.builtin.lineinfile:
+        path: "{{ log_file_path }}"
+        line: >-
+          [{{ play_timestamp }}] - {{ inventory_hostname }} - Appli MAJ Sécurité -
+          {% set attempted_packages_list = security_package_names_to_update | join(', ') %}
+          {% if apply_security_updates_result.failed %}STATUT: FAILED. Erreur: {{ apply_security_updates_result.msg | default('Détail non disponible') }}. Paquets ciblés: [{{ attempted_packages_list }}].
+          {% elif apply_security_updates_result.changed %}
+            {% set upgraded_pkgs = apply_security_updates_result.changes.upgraded | default([]) %}
+            {% set installed_pkgs = apply_security_updates_result.changes.installed | default([]) %}
+            STATUT: SUCCESS_CHANGED. Paquets mis à jour: [{{ upgraded_pkgs | join(', ') }}]. Nouveaux paquets installés (dépendances potentielles): [{{ installed_pkgs | join(', ') }}]. Paquets initialement ciblés: [{{ attempted_packages_list }}].
+          {% else %}STATUT: SUCCESS_NO_CHANGE. Aucun des paquets ciblés ([{{ attempted_packages_list }}]) n'a été modifié (probablement déjà à jour ou non applicable).
+          {% endif %}
+        create: yes
+        mode: '0644'
+      delegate_to: localhost
+      become: no
+      tags: security_apply, logging
+      when: apply_security_updates_result is defined and not apply_security_updates_result.skipped
+
+    - name: Signalement Machine Patchée - CRÉATION FICHIER FLAG
+      ansible.builtin.file:
+        path: "{{ patch_success_flag_filename_template }}"
+        state: touch
+        mode: '0644'
+      register: flag_file_creation_result
+      tags: patch_signal
+      when:
+        - security_package_names_to_update is defined
+        - security_package_names_to_update | length > 0
+        - apply_security_updates_result is defined
+        - not apply_security_updates_result.failed
+
+    - name: Signalement Machine Patchée - CRÉATION FLAG - RÉSULTAT
+      ansible.builtin.lineinfile:
+        path: "{{ log_file_path }}"
+        line: >-
+          [{{ play_timestamp }}] - {{ inventory_hostname }} - Signalement Patch -
+          {% if flag_file_creation_result.failed %}Création du fichier flag {{ flag_file_creation_result.path }} ÉCHOUÉE. Erreur: {{ flag_file_creation_result.msg | default ('Détail non disponible') }}. - FAILED
+          {% elif flag_file_creation_result.changed %}Fichier flag {{ flag_file_creation_result.path }} créé/mis à jour avec succès. - SUCCESS_CHANGED
+          {% else %}Fichier flag {{ flag_file_creation_result.path }} déjà présent et non modifié. - SUCCESS_NO_CHANGE
+          {% endif %}
+        create: yes
+        mode: '0644'
+      delegate_to: localhost
+      become: no
+      tags: patch_signal, logging
+      when: flag_file_creation_result is defined and not flag_file_creation_result.skipped
+
+    - name: Logging Global - FIN pour l'hôte
+      ansible.builtin.lineinfile:
+        path: "{{ log_file_path }}"
+        line: "[{{ play_timestamp }}] - {{ inventory_hostname }} - GLOBAL - Traitement de l'hôte terminé. - COMPLETED"
+        create: yes
+        mode: '0644'
+      delegate_to: localhost
+      become: no
+      tags: logging
+
+  # --- DÉBUT DES TÂCHES POST-EXÉCUTION ---
+  post_tasks:
+    - name: Signalement Grafana - Créer le fichier de statut
+      ansible.builtin.copy:
+        content: |
+          {
+            "patched_hosts": {{ (ansible_play_hosts_all | map('extract', hostvars) | selectattr('flag_file_creation_result', 'defined') | list | length) }},
+            "total_hosts": {{ ansible_play_hosts_all | length }},
+            "timestamp": "{{ play_timestamp }}"
+          }
+        dest: "~/status.json" # Crée le fichier dans le répertoire personnel de l'utilisateur WSL
+      delegate_to: localhost
+      run_once: true
+      become: no
+      tags: grafana_signal, logging
